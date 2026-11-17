@@ -5,11 +5,8 @@
 -- What it does right now:
 --   - one 16-bit stopwatch with run/pause/reset
 --   - 4 resolutions: 1 ms, 10 ms, 100 ms, 1 s
---   - laps get saved in a FIFO (8 deep) so the program can read them later
---   - button presses get timestamped in hardware into a second FIFO (16 deep)
---
--- Register map is in REGISTER_MAP.md
--- TODO: simulate before hooking into SCOMP
+--   - laps get saved in a queue (8 deep) so the program can read them later
+--   - button presses get timestamped in hardware into a second queue (16 deep)
 
 LIBRARY IEEE;
 LIBRARY LPM;
