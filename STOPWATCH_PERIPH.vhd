@@ -1,343 +1,373 @@
--- ============================================================================
 -- STOPWATCH_PERIPH.vhd
--- ECE 2031 design project baseline: single-stopwatch peripheral for SCOMP
+-- ECE 2031 Final Project
+-- Stopwatch peripheral for SCOMP (uses I/O addresses 0x70-0x7F)
 --
--- Features (baseline):
---   * One 16-bit stopwatch: run/pause, reset, resolution (1 ms/10 ms/100 ms/1 s)
---   * Software-triggered laps stored in a lap FIFO
---   * Hardware event capture: an input (e.g. a debounced pushbutton) stamps the
---     current time into an event FIFO, with no CPU involvement
+-- What it does right now:
+--   - one 16-bit stopwatch with run/pause/reset
+--   - 4 resolutions: 1 ms, 10 ms, 100 ms, 1 s
+--   - laps get saved in a FIFO (8 deep) so the program can read them later
+--   - button presses get timestamped in hardware into a second FIFO (16 deep)
 --
--- I/O map (offsets from 0x70; IO_ADDR = low nibble of the I/O address):
---   0x70 CTRL        W/R  bit0 RUN, bit1 RESET (pulse), bits5:4 resolution
---   0x71 TIME        R    current elapsed time
---   0x72 LAP         W    record a lap   | R  pop oldest lap (0 if empty)
---   0x73 STATUS      R    3:0 lap count, 4 full, 5 lap lost, 6 overflow, 7 running
---   0x74 EVT_CTRL    W/R  bit0 enable capture, bit1 clear event FIFO (pulse)
---   0x75 EVT_READ    R    pop oldest event timestamp (0 if empty)
---   0x76 EVT_STATUS  R    4:0 count, 5 full, 6 lost, 7 enabled
---   0x77-0x7F        reserved
---
--- NOTE: baseline, not yet simulated. See the TODO/CHECK comments.
--- ============================================================================
+-- Register map is in REGISTER_MAP.md
+-- TODO: simulate before hooking into SCOMP
 
-library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+LIBRARY IEEE;
+LIBRARY LPM;
 
-entity STOPWATCH_PERIPH is
-  generic (
-    CLK_HZ      : natural := 50_000_000;  -- frequency of CLK_FAST (CHECK: your clock)
-    LAP_DEPTH   : natural := 8;           -- laps stored (power of 2)
-    EVT_DEPTH   : natural := 16;          -- event timestamps stored (power of 2)
-    DEBOUNCE_MS : natural := 10           -- input must be stable this long
+USE IEEE.STD_LOGIC_1164.ALL;
+USE IEEE.NUMERIC_STD.ALL;
+USE LPM.LPM_COMPONENTS.ALL;
+
+
+ENTITY STOPWATCH_PERIPH IS
+  PORT(
+    CLOCK    : IN    STD_LOGIC;                      -- fast clock (50 MHz), used for counting
+    RESETN   : IN    STD_LOGIC;
+    CS       : IN    STD_LOGIC;                      -- high for any address 0x70-0x7F
+    IO_WRITE : IN    STD_LOGIC;
+    IO_ADDR  : IN    STD_LOGIC_VECTOR(3 DOWNTO 0);   -- low 4 bits of the address
+    IO_DATA  : INOUT STD_LOGIC_VECTOR(15 DOWNTO 0);
+    BTN      : IN    STD_LOGIC                       -- button for event capture (active high)
   );
-  port (
-    CLK_FAST : in    std_logic;                     -- counting clock, much faster than SCOMP's I/O rate
-    RESETN   : in    std_logic;
-    CS       : in    std_logic;                     -- asserted for any address 0x70-0x7F
-    IO_WRITE : in    std_logic;
-    IO_ADDR  : in    std_logic_vector(3 downto 0);  -- low nibble of the I/O address
-    IO_DATA  : inout std_logic_vector(15 downto 0);
-    EVT_IN   : in    std_logic                      -- event input, active high (invert KEY if needed)
-  );
-end entity STOPWATCH_PERIPH;
+END STOPWATCH_PERIPH;
 
-architecture rtl of STOPWATCH_PERIPH is
 
-  constant MS_DIV : natural := CLK_HZ / 1000;
+ARCHITECTURE a OF STOPWATCH_PERIPH IS
 
-  subtype word_t is unsigned(15 downto 0);
-  type lap_fifo_t is array (0 to LAP_DEPTH-1) of word_t;
-  type evt_fifo_t is array (0 to EVT_DEPTH-1) of word_t;
+  -- 50 MHz / 50,000 = 1 kHz, so this gives us a 1 ms tick
+  -- change this if we use a different clock
+  CONSTANT MS_COUNT : INTEGER := 50000;
 
-  -- ---------------- bus side (clocked by CS edges) ----------------
-  signal wr_addr  : std_logic_vector(3 downto 0);
-  signal wr_data  : std_logic_vector(15 downto 0);
-  signal rd_addr  : std_logic_vector(3 downto 0);
-  signal is_read  : std_logic;
-  signal wr_tog   : std_logic;   -- flips once per write
-  signal pop_tog  : std_logic;   -- flips once per FIFO-popping read
-  signal pop_addr : std_logic_vector(3 downto 0);
-  signal rd_data  : std_logic_vector(15 downto 0);
+  TYPE LAP_ARRAY IS ARRAY (0 TO 7)  OF UNSIGNED(15 DOWNTO 0);
+  TYPE EVT_ARRAY IS ARRAY (0 TO 15) OF UNSIGNED(15 DOWNTO 0);
 
-  -- ---------------- synchronizers into CLK_FAST ----------------
-  signal wr_sync  : std_logic_vector(2 downto 0);
-  signal pop_sync : std_logic_vector(2 downto 0);
-  signal evt_sync : std_logic_vector(1 downto 0);
+  -- stuff latched from SCOMP writes/reads
+  SIGNAL wr_addr  : STD_LOGIC_VECTOR(3 DOWNTO 0);
+  SIGNAL wr_data  : STD_LOGIC_VECTOR(15 DOWNTO 0);
+  SIGNAL rd_addr  : STD_LOGIC_VECTOR(3 DOWNTO 0);
+  SIGNAL is_read  : STD_LOGIC;
+  SIGNAL pop_addr : STD_LOGIC_VECTOR(3 DOWNTO 0);
+  SIGNAL wr_flag  : STD_LOGIC;   -- flips every time SCOMP writes to us
+  SIGNAL pop_flag : STD_LOGIC;   -- flips every time SCOMP reads a FIFO
+  SIGNAL rd_data  : STD_LOGIC_VECTOR(15 DOWNTO 0);
+  SIGNAL out_en   : STD_LOGIC;
 
-  -- ---------------- tick generation ----------------
-  signal ms_cnt   : natural range 0 to MS_DIV-1;
-  signal c10, c100, c1k : natural range 0 to 9;
-  signal tick_ms, tick_10, tick_100, tick_1s : std_logic;
+  -- syncing the flags + button into the CLOCK side
+  SIGNAL wr_sync  : STD_LOGIC_VECTOR(2 DOWNTO 0);
+  SIGNAL pop_sync : STD_LOGIC_VECTOR(2 DOWNTO 0);
+  SIGNAL btn_sync : STD_LOGIC_VECTOR(1 DOWNTO 0);
+  SIGNAL new_wr   : STD_LOGIC;
+  SIGNAL new_pop  : STD_LOGIC;
 
-  -- ---------------- stopwatch state ----------------
-  signal sw_time  : word_t;
-  signal sw_run   : std_logic;
-  signal sw_res   : std_logic_vector(1 downto 0);
-  signal sw_ovf   : std_logic;
+  -- tick counters
+  SIGNAL ms_cnt   : UNSIGNED(15 DOWNTO 0);
+  SIGNAL cnt10    : UNSIGNED(3 DOWNTO 0);
+  SIGNAL cnt100   : UNSIGNED(3 DOWNTO 0);
+  SIGNAL cnt1s    : UNSIGNED(3 DOWNTO 0);
+  SIGNAL tick_1ms   : STD_LOGIC;
+  SIGNAL tick_10ms  : STD_LOGIC;
+  SIGNAL tick_100ms : STD_LOGIC;
+  SIGNAL tick_1s    : STD_LOGIC;
+  SIGNAL tick       : STD_LOGIC;   -- whichever tick matches the resolution
 
-  signal lap_mem  : lap_fifo_t;
-  signal lap_rd   : natural range 0 to LAP_DEPTH-1;
-  signal lap_wr   : natural range 0 to LAP_DEPTH-1;
-  signal lap_cnt  : natural range 0 to LAP_DEPTH;
-  signal lap_lost : std_logic;
+  -- stopwatch
+  SIGNAL sw_time  : UNSIGNED(15 DOWNTO 0);
+  SIGNAL sw_run   : STD_LOGIC;
+  SIGNAL sw_res   : STD_LOGIC_VECTOR(1 DOWNTO 0);
+  SIGNAL sw_ovf   : STD_LOGIC;
 
-  -- ---------------- event capture ----------------
-  signal evt_mem    : evt_fifo_t;
-  signal evt_rd     : natural range 0 to EVT_DEPTH-1;
-  signal evt_wr     : natural range 0 to EVT_DEPTH-1;
-  signal evt_cnt    : natural range 0 to EVT_DEPTH;
-  signal evt_lost   : std_logic;
-  signal evt_en     : std_logic;
-  signal evt_stable : std_logic;
-  signal db_cnt     : natural range 0 to DEBOUNCE_MS;
+  -- lap FIFO (3-bit pointers wrap around at 8 on their own)
+  SIGNAL lap_mem  : LAP_ARRAY;
+  SIGNAL lap_rd   : UNSIGNED(2 DOWNTO 0);
+  SIGNAL lap_wr   : UNSIGNED(2 DOWNTO 0);
+  SIGNAL lap_cnt  : UNSIGNED(3 DOWNTO 0);
+  SIGNAL lap_lost : STD_LOGIC;
 
-begin
+  -- event FIFO (4-bit pointers wrap around at 16)
+  SIGNAL evt_mem  : EVT_ARRAY;
+  SIGNAL evt_rd   : UNSIGNED(3 DOWNTO 0);
+  SIGNAL evt_wr   : UNSIGNED(3 DOWNTO 0);
+  SIGNAL evt_cnt  : UNSIGNED(4 DOWNTO 0);
+  SIGNAL evt_lost : STD_LOGIC;
+  SIGNAL evt_en   : STD_LOGIC;
+  SIGNAL btn_prev : STD_LOGIC;
+  SIGNAL evt_push : STD_LOGIC;
+  SIGNAL evt_pop  : STD_LOGIC;
+  SIGNAL evt_ok   : STD_LOGIC;   -- push is allowed (not full, or popping at the same time)
 
-  -- ==========================================================================
-  -- 1. BUS INTERFACE
-  -- Writes are captured on CS edges, not by sampling CS with a clock (per the
-  -- course tip). CHECK: match the edge your course's LEDs.vhd / DIG_OUT uses.
-  -- ==========================================================================
-  bus_latch : process (RESETN, CS)
-  begin
-    if RESETN = '0' then
-      wr_tog  <= '0';
-      wr_addr <= (others => '0');
-      wr_data <= (others => '0');
-      rd_addr <= (others => '0');
+BEGIN
+
+  -- ---------------------------------------------------------------
+  -- SCOMP side
+  -- prof said not to sample CS with a clock, so we grab writes on the
+  -- rising edge of CS instead (same idea as LEDs.vhd)
+  -- ---------------------------------------------------------------
+  PROCESS (RESETN, CS)
+  BEGIN
+    IF (RESETN = '0') THEN
+      wr_flag <= '0';
+      wr_addr <= "0000";
+      wr_data <= x"0000";
+      rd_addr <= "0000";
       is_read <= '0';
-    elsif rising_edge(CS) then
-      if IO_WRITE = '1' then
+    ELSIF RISING_EDGE(CS) THEN
+      IF (IO_WRITE = '1') THEN
         wr_addr <= IO_ADDR;
         wr_data <= IO_DATA;
-        wr_tog  <= not wr_tog;       -- tell the fast domain "new command"
+        wr_flag <= NOT wr_flag;    -- tells the clock side there's a new command
         is_read <= '0';
-      else
+      ELSE
         rd_addr <= IO_ADDR;
         is_read <= '1';
-      end if;
-    end if;
-  end process;
+      END IF;
+    END IF;
+  END PROCESS;
 
-  -- A read of a FIFO address pops it at the END of the read (falling edge of
-  -- CS), so SCOMP latches the value before the FIFO advances.
-  pop_latch : process (RESETN, CS)
-  begin
-    if RESETN = '0' then
-      pop_tog  <= '0';
-      pop_addr <= (others => '0');
-    elsif falling_edge(CS) then
-      if is_read = '1' and (rd_addr = x"2" or rd_addr = x"5") then
+  -- reading a FIFO should remove the item, but only AFTER SCOMP has
+  -- grabbed the value, so we do it on the falling edge of CS
+  PROCESS (RESETN, CS)
+  BEGIN
+    IF (RESETN = '0') THEN
+      pop_flag <= '0';
+      pop_addr <= "0000";
+    ELSIF FALLING_EDGE(CS) THEN
+      IF (is_read = '1') AND (rd_addr = "0010" OR rd_addr = "0101") THEN
         pop_addr <= rd_addr;
-        pop_tog  <= not pop_tog;
-      end if;
-    end if;
-  end process;
+        pop_flag <= NOT pop_flag;
+      END IF;
+    END IF;
+  END PROCESS;
 
-  -- ==========================================================================
-  -- 2. TICK GENERATION: 1 ms base tick, then /10 cascades
-  -- Each tick_* is a single CLK_FAST-cycle pulse.
-  -- ==========================================================================
-  tick_ms  <= '1'      when ms_cnt = MS_DIV-1 else '0';
-  tick_10  <= tick_ms  when c10  = 9 else '0';
-  tick_100 <= tick_10  when c100 = 9 else '0';
-  tick_1s  <= tick_100 when c1k  = 9 else '0';
+  -- a flag changing value = SCOMP did something we need to handle
+  new_wr  <= wr_sync(2)  XOR wr_sync(1);
+  new_pop <= pop_sync(2) XOR pop_sync(1);
 
-  -- ==========================================================================
-  -- 3. MAIN LOGIC (CLK_FAST domain)
-  -- Order matters: later assignments in this process win, so commands
-  -- (reset, clear) come last and override counting.
-  -- ==========================================================================
-  main : process (RESETN, CLK_FAST)
-    variable wr_ev, pop_ev : boolean;
-    variable evt_push      : boolean;
-    variable ecnt          : natural range 0 to EVT_DEPTH;
-    variable tick          : std_logic;
-  begin
-    if RESETN = '0' then
-      wr_sync    <= (others => '0');
-      pop_sync   <= (others => '0');
-      evt_sync   <= (others => '0');
-      ms_cnt     <= 0;
-      c10        <= 0;
-      c100       <= 0;
-      c1k        <= 0;
-      sw_time    <= (others => '0');
-      sw_run     <= '0';
-      sw_res     <= "00";
-      sw_ovf     <= '0';
-      lap_rd     <= 0;
-      lap_wr     <= 0;
-      lap_cnt    <= 0;
-      lap_lost   <= '0';
-      evt_rd     <= 0;
-      evt_wr     <= 0;
-      evt_cnt    <= 0;
-      evt_lost   <= '0';
-      evt_en     <= '0';
-      evt_stable <= '0';
-      db_cnt     <= 0;
 
-    elsif rising_edge(CLK_FAST) then
+  -- ---------------------------------------------------------------
+  -- ticks: 1 ms from the clock, then divide by 10 three times
+  -- each tick is high for only one clock cycle
+  -- ---------------------------------------------------------------
+  tick_1ms   <= '1'        WHEN ms_cnt = MS_COUNT - 1 ELSE '0';
+  tick_10ms  <= tick_1ms   WHEN cnt10  = 9 ELSE '0';
+  tick_100ms <= tick_10ms  WHEN cnt100 = 9 ELSE '0';
+  tick_1s    <= tick_100ms WHEN cnt1s  = 9 ELSE '0';
 
-      -- ---- synchronize bus toggles and the event input ----
-      wr_sync  <= wr_sync(1 downto 0)  & wr_tog;
-      pop_sync <= pop_sync(1 downto 0) & pop_tog;
-      evt_sync <= evt_sync(0) & EVT_IN;
-      wr_ev    := (wr_sync(2)  /= wr_sync(1));    -- a toggle changed = new request
-      pop_ev   := (pop_sync(2) /= pop_sync(1));
-      evt_push := false;
+  WITH sw_res SELECT tick <=
+    tick_1ms   WHEN "00",
+    tick_10ms  WHEN "01",
+    tick_100ms WHEN "10",
+    tick_1s    WHEN OTHERS;
 
-      -- ---- tick dividers ----
-      if ms_cnt = MS_DIV-1 then ms_cnt <= 0; else ms_cnt <= ms_cnt + 1; end if;
-      if tick_ms  = '1' then if c10  = 9 then c10  <= 0; else c10  <= c10  + 1; end if; end if;
-      if tick_10  = '1' then if c100 = 9 then c100 <= 0; else c100 <= c100 + 1; end if; end if;
-      if tick_100 = '1' then if c1k  = 9 then c1k  <= 0; else c1k  <= c1k  + 1; end if; end if;
 
-      -- ---- count at the selected resolution ----
-      case sw_res is
-        when "00"   => tick := tick_ms;
-        when "01"   => tick := tick_10;
-        when "10"   => tick := tick_100;
-        when others => tick := tick_1s;
-      end case;
-      if sw_run = '1' and tick = '1' then
-        if sw_time = x"FFFF" then
-          sw_ovf <= '1';                         -- wrapped around
-        end if;
+  -- ---------------------------------------------------------------
+  -- event FIFO control
+  -- button is sampled every 10 ms, which also debounces it
+  -- (a press only counts when it goes from 0 to 1 between samples)
+  -- ---------------------------------------------------------------
+  evt_push <= '1' WHEN (tick_10ms = '1' AND btn_sync(1) = '1' AND btn_prev = '0'
+                        AND evt_en = '1') ELSE '0';
+  evt_pop  <= '1' WHEN (new_pop = '1' AND pop_addr = "0101" AND evt_cnt /= 0) ELSE '0';
+  evt_ok   <= '1' WHEN (evt_push = '1' AND (evt_cnt /= 16 OR evt_pop = '1')) ELSE '0';
+
+
+  -- ---------------------------------------------------------------
+  -- main logic (everything on CLOCK)
+  -- commands are at the bottom on purpose: last assignment wins in a
+  -- process, so a reset always beats a count in the same cycle
+  -- ---------------------------------------------------------------
+  PROCESS (RESETN, CLOCK)
+  BEGIN
+    IF (RESETN = '0') THEN
+      wr_sync  <= "000";
+      pop_sync <= "000";
+      btn_sync <= "00";
+      ms_cnt   <= (OTHERS => '0');
+      cnt10    <= "0000";
+      cnt100   <= "0000";
+      cnt1s    <= "0000";
+      sw_time  <= x"0000";
+      sw_run   <= '0';
+      sw_res   <= "00";
+      sw_ovf   <= '0';
+      lap_rd   <= "000";
+      lap_wr   <= "000";
+      lap_cnt  <= "0000";
+      lap_lost <= '0';
+      evt_rd   <= "0000";
+      evt_wr   <= "0000";
+      evt_cnt  <= "00000";
+      evt_lost <= '0';
+      evt_en   <= '0';
+      btn_prev <= '0';
+
+    ELSIF RISING_EDGE(CLOCK) THEN
+
+      -- 2 flip flops so we don't get metastability from the other side
+      wr_sync  <= wr_sync(1 DOWNTO 0)  & wr_flag;
+      pop_sync <= pop_sync(1 DOWNTO 0) & pop_flag;
+      btn_sync <= btn_sync(0) & BTN;
+
+      -- tick counters
+      IF (ms_cnt = MS_COUNT - 1) THEN
+        ms_cnt <= (OTHERS => '0');
+      ELSE
+        ms_cnt <= ms_cnt + 1;
+      END IF;
+
+      IF (tick_1ms = '1') THEN
+        IF (cnt10 = 9) THEN cnt10 <= "0000"; ELSE cnt10 <= cnt10 + 1; END IF;
+      END IF;
+      IF (tick_10ms = '1') THEN
+        IF (cnt100 = 9) THEN cnt100 <= "0000"; ELSE cnt100 <= cnt100 + 1; END IF;
+      END IF;
+      IF (tick_100ms = '1') THEN
+        IF (cnt1s = 9) THEN cnt1s <= "0000"; ELSE cnt1s <= cnt1s + 1; END IF;
+      END IF;
+
+      -- count up if running
+      IF (sw_run = '1' AND tick = '1') THEN
+        IF (sw_time = x"FFFF") THEN
+          sw_ovf <= '1';           -- about to wrap back to 0
+        END IF;
         sw_time <= sw_time + 1;
-      end if;
+      END IF;
 
-      -- ---- debounce the event input; a clean rising edge = one event ----
-      if evt_sync(1) /= evt_stable then
-        if tick_ms = '1' then
-          if db_cnt = DEBOUNCE_MS-1 then
-            evt_stable <= evt_sync(1);
-            db_cnt     <= 0;
-            if evt_sync(1) = '1' then
-              evt_push := true;
-            end if;
-          else
-            db_cnt <= db_cnt + 1;
-          end if;
-        end if;
-      else
-        db_cnt <= 0;
-      end if;
+      -- button sampling for the debounce
+      IF (tick_10ms = '1') THEN
+        btn_prev <= btn_sync(1);
+      END IF;
 
-      -- ---- event FIFO: pop (from a read) and push (from hardware) ----
-      -- Both can happen in the same cycle, so the count is a variable.
-      ecnt := evt_cnt;
-      if pop_ev and pop_addr = x"5" and ecnt > 0 then
-        evt_rd <= (evt_rd + 1) mod EVT_DEPTH;
-        ecnt   := ecnt - 1;
-      end if;
-      if evt_push and evt_en = '1' then
-        if ecnt < EVT_DEPTH then
-          evt_mem(evt_wr) <= sw_time;            -- timestamp, no CPU involved
-          evt_wr <= (evt_wr + 1) mod EVT_DEPTH;
-          ecnt   := ecnt + 1;
-        else
-          evt_lost <= '1';                       -- full: drop newest
-        end if;
-      end if;
-      evt_cnt <= ecnt;
+      -- event FIFO
+      IF (evt_pop = '1') THEN
+        evt_rd <= evt_rd + 1;
+      END IF;
+      IF (evt_ok = '1') THEN
+        evt_mem(TO_INTEGER(evt_wr)) <= sw_time;   -- save the timestamp
+        evt_wr <= evt_wr + 1;
+      END IF;
+      IF (evt_push = '1' AND evt_ok = '0') THEN
+        evt_lost <= '1';           -- FIFO was full, press got dropped
+      END IF;
+      IF (evt_ok = '1' AND evt_pop = '0') THEN
+        evt_cnt <= evt_cnt + 1;
+      ELSIF (evt_pop = '1' AND evt_ok = '0') THEN
+        evt_cnt <= evt_cnt - 1;
+      END IF;
 
-      -- ---- lap FIFO pop (read of 0x72) ----
-      -- Lap pushes and pops both come from SCOMP instructions, so they never
-      -- land in the same cycle.
-      if pop_ev and pop_addr = x"2" and lap_cnt > 0 then
-        lap_rd  <= (lap_rd + 1) mod LAP_DEPTH;
+      -- lap FIFO pop (SCOMP read 0x72)
+      IF (new_pop = '1' AND pop_addr = "0010" AND lap_cnt /= 0) THEN
+        lap_rd  <= lap_rd + 1;
         lap_cnt <= lap_cnt - 1;
-      end if;
+      END IF;
 
-      -- ---- commands from SCOMP writes ----
-      if wr_ev then
-        case wr_addr is
+      -- commands from SCOMP
+      IF (new_wr = '1') THEN
+        CASE wr_addr IS
 
-          when x"0" =>                                   -- CTRL
+          WHEN "0000" =>           -- 0x70 CTRL
             sw_run <= wr_data(0);
-            sw_res <= wr_data(5 downto 4);
-            if wr_data(1) = '1' then
-              sw_time  <= (others => '0');
+            sw_res <= wr_data(5 DOWNTO 4);
+            IF (wr_data(1) = '1') THEN
+              sw_time  <= x"0000";
               sw_ovf   <= '0';
-              lap_rd   <= 0;
-              lap_wr   <= 0;
-              lap_cnt  <= 0;
+              lap_rd   <= "000";
+              lap_wr   <= "000";
+              lap_cnt  <= "0000";
               lap_lost <= '0';
-            end if;
+            END IF;
 
-          when x"2" =>                                   -- LAP: record a lap
-            if lap_cnt < LAP_DEPTH then
-              lap_mem(lap_wr) <= sw_time;
-              lap_wr  <= (lap_wr + 1) mod LAP_DEPTH;
+          WHEN "0010" =>           -- 0x72 record a lap
+            IF (lap_cnt /= 8) THEN
+              lap_mem(TO_INTEGER(lap_wr)) <= sw_time;
+              lap_wr  <= lap_wr + 1;
               lap_cnt <= lap_cnt + 1;
-            else
-              lap_lost <= '1';                           -- full: drop newest
-            end if;
+            ELSE
+              lap_lost <= '1';     -- full, lap gets dropped
+            END IF;
 
-          when x"4" =>                                   -- EVT_CTRL
+          WHEN "0100" =>           -- 0x74 EVT_CTRL
             evt_en <= wr_data(0);
-            if wr_data(1) = '1' then
-              evt_rd   <= 0;
-              evt_wr   <= 0;
-              evt_cnt  <= 0;
+            IF (wr_data(1) = '1') THEN
+              evt_rd   <= "0000";
+              evt_wr   <= "0000";
+              evt_cnt  <= "00000";
               evt_lost <= '0';
-            end if;
+            END IF;
 
-          when others =>
-            null;                                        -- reserved / read-only
-        end case;
-      end if;
+          WHEN OTHERS =>
+            NULL;
 
-    end if;
-  end process;
+        END CASE;
+      END IF;
 
-  -- ==========================================================================
-  -- 4. READ MUX (combinational) + tri-state onto IO_DATA
-  -- TODO: TIME can change mid-read; consider latching it (snapshot read).
-  -- ==========================================================================
-  read_mux : process (IO_ADDR, sw_run, sw_res, sw_time, sw_ovf,
-                      lap_mem, lap_rd, lap_cnt, lap_lost,
-                      evt_mem, evt_rd, evt_cnt, evt_lost, evt_en)
-  begin
-    rd_data <= (others => '0');
-    case IO_ADDR is
-      when x"0" =>
+    END IF;
+  END PROCESS;
+
+
+  -- ---------------------------------------------------------------
+  -- what SCOMP sees when it reads each address
+  -- TODO: sw_time could change in the middle of a read, maybe latch it
+  -- ---------------------------------------------------------------
+  PROCESS (IO_ADDR, sw_run, sw_res, sw_time, sw_ovf, lap_mem, lap_rd, lap_cnt,
+           lap_lost, evt_mem, evt_rd, evt_cnt, evt_lost, evt_en)
+  BEGIN
+    rd_data <= x"0000";
+    CASE IO_ADDR IS
+
+      WHEN "0000" =>               -- 0x70 CTRL
         rd_data(0)          <= sw_run;
-        rd_data(5 downto 4) <= sw_res;
-      when x"1" =>
-        rd_data <= std_logic_vector(sw_time);
-      when x"2" =>
-        if lap_cnt > 0 then
-          rd_data <= std_logic_vector(lap_mem(lap_rd));
-        end if;
-      when x"3" =>
-        rd_data(3 downto 0) <= std_logic_vector(to_unsigned(lap_cnt, 4));
-        if lap_cnt = LAP_DEPTH then rd_data(4) <= '1'; end if;
+        rd_data(5 DOWNTO 4) <= sw_res;
+
+      WHEN "0001" =>               -- 0x71 TIME
+        rd_data <= STD_LOGIC_VECTOR(sw_time);
+
+      WHEN "0010" =>               -- 0x72 oldest lap (0 if empty)
+        IF (lap_cnt /= 0) THEN
+          rd_data <= STD_LOGIC_VECTOR(lap_mem(TO_INTEGER(lap_rd)));
+        END IF;
+
+      WHEN "0011" =>               -- 0x73 STATUS
+        rd_data(3 DOWNTO 0) <= STD_LOGIC_VECTOR(lap_cnt);
+        IF (lap_cnt = 8) THEN
+          rd_data(4) <= '1';
+        END IF;
         rd_data(5) <= lap_lost;
         rd_data(6) <= sw_ovf;
         rd_data(7) <= sw_run;
-      when x"4" =>
+
+      WHEN "0100" =>               -- 0x74 EVT_CTRL
         rd_data(0) <= evt_en;
-      when x"5" =>
-        if evt_cnt > 0 then
-          rd_data <= std_logic_vector(evt_mem(evt_rd));
-        end if;
-      when x"6" =>
-        rd_data(4 downto 0) <= std_logic_vector(to_unsigned(evt_cnt, 5));
-        if evt_cnt = EVT_DEPTH then rd_data(5) <= '1'; end if;
+
+      WHEN "0101" =>               -- 0x75 oldest event (0 if empty)
+        IF (evt_cnt /= 0) THEN
+          rd_data <= STD_LOGIC_VECTOR(evt_mem(TO_INTEGER(evt_rd)));
+        END IF;
+
+      WHEN "0110" =>               -- 0x76 EVT_STATUS
+        rd_data(4 DOWNTO 0) <= STD_LOGIC_VECTOR(evt_cnt);
+        IF (evt_cnt = 16) THEN
+          rd_data(5) <= '1';
+        END IF;
         rd_data(6) <= evt_lost;
         rd_data(7) <= evt_en;
-      when others =>
-        null;
-    end case;
-  end process;
 
-  -- Drive the bus only during a read of this peripheral.
-  -- CHECK: the course template may use LPM_BUSTRI instead; either works.
-  IO_DATA <= rd_data when (CS = '1' and IO_WRITE = '0') else (others => 'Z');
+      WHEN OTHERS =>
+        NULL;
 
-end architecture rtl;
+    END CASE;
+  END PROCESS;
+
+  -- only drive the bus when SCOMP is reading from us
+  out_en <= CS AND NOT IO_WRITE;
+
+  IO_BUS : LPM_BUSTRI
+  GENERIC MAP (
+    lpm_width => 16
+  )
+  PORT MAP (
+    data     => rd_data,
+    enabledt => out_en,
+    tridata  => IO_DATA
+  );
+
+END a;
